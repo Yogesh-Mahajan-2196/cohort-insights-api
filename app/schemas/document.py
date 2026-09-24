@@ -24,5 +24,8 @@ class DocumentResponse(BaseModel):
     content_version: int
     content_hash: str
     summary: str | None = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
+
     failed_stage: str | None = None
+
+    is_stale: bool = False
