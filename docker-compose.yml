@@ -1,8 +1,9 @@
 services:
 
   mongodb:
-    image: mongo:8
+    image: mongo:7
     container_name: cohort-mongodb
+    restart: unless-stopped
     ports:
       - "27017:27017"
     volumes:
@@ -11,8 +12,51 @@ services:
   redis:
     image: redis:7
     container_name: cohort-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
+
+  api:
+    build: .
+    container_name: cohort-api
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: cohort_insights
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+    command:
+      [
+        "uvicorn",
+        "main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+      ]
+
+  worker:
+    build: .
+    container_name: cohort-worker
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: cohort_insights
+      REDIS_URL: redis://redis:6379
+    command:
+      [
+        "python",
+        "-m",
+        "workers.processor"
+      ]
+
 
 volumes:
   mongodb_data:

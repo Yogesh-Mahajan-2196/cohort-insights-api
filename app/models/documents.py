@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-
+from bson import ObjectId
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -13,6 +13,7 @@ def build_document(
     client_doc_ref: str | None = None,
 ):
     document = {
+        "_id": ObjectId(),
         "user_id": user_id,
         "title": title,
         "content": content,

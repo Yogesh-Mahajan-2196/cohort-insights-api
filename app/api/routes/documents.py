@@ -29,6 +29,14 @@ document_router = APIRouter(
     tags=["Documents"],
 )
 
+ALLOWED_DOCUMENT_STATUSES = {
+    "queued",
+    "processing",
+    "enriching",
+    "completed",
+    "failed",
+}
+
 
 async def get_current_user_id(
     x_user_id: str | None = Header(
@@ -36,12 +44,6 @@ async def get_current_user_id(
         alias="X-User-Id",
     ),
 ):
-    """
-    Simulates an authenticated user.
-
-    In production this would come from JWT/session
-    authentication rather than a header.
-    """
 
     if not x_user_id:
         raise HTTPException(
@@ -65,18 +67,25 @@ async def create_document_api(
     payload: DocumentCreate,
     current_user_id: str = Depends(get_current_user_id),
     db=Depends(get_database),
-    redis=Depends(get_redis),
+    redis_client=Depends(get_redis),
 ):
-    # The submitting user must match the authenticated user.
-    if payload.user_id != current_user_id:
+    
+    if (
+        hasattr(payload, "user_id")
+        and payload.user_id is not None
+        and payload.user_id != current_user_id
+    ):
         raise HTTPException(
-            status_code=403,
-            detail="Cannot create a document for another user",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Cannot create a document for "
+                "another user"
+            ),
         )
 
     document = await create_document(
         db=db,
-        redis=redis,
+        redis_client=redis_client,
         user_id=current_user_id,
         title=payload.title,
         content=payload.content,
@@ -147,6 +156,20 @@ async def list_user_documents(
             detail="User not found",
         )
 
+    if (
+        status_filter is not None
+        and status_filter not in ALLOWED_DOCUMENT_STATUSES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid status. Allowed values: "
+                + ", ".join(
+                    sorted(ALLOWED_DOCUMENT_STATUSES)
+                )
+            ),
+        )
+
     query = {
         "user_id": current_user_id,
     }
@@ -164,17 +187,17 @@ async def list_user_documents(
         .limit(page_size)
     )
 
-    documents = await cursor.to_list(
-        length=page_size,
-    )
+    documents = []
+    
+    async for document in cursor:
+        documents.append(
+            build_document_response(document)
+        )
 
     return {
         "page": page,
         "page_size": page_size,
-        "documents": [
-            build_document_response(document)
-            for document in documents
-        ],
+        "documents": documents,
     }
 
 
@@ -197,9 +220,11 @@ async def get_document_api(
             detail="Document not found",
         )
 
+    object_id = ObjectId(document_id)
+
     document = await db.documents.find_one(
         {
-            "_id": ObjectId(document_id),
+            "_id": object_id,
             "user_id": current_user_id,
         }
     )
@@ -230,7 +255,7 @@ async def update_document_api(
 ):
     document = await update_document(
         db=db,
-        redis=redis,
+        redis_client=redis,
         document_id=document_id,
         user_id=current_user_id,
         content=data.content,

@@ -15,8 +15,8 @@ async def create_consumer_group(redis):
             raise
 
 
-async def enqueue_document(redis, document_id: str, version: int):
-    message_id = await redis.xadd(
+async def enqueue_document(redis_client, document_id: str, version: int):
+    message_id = await redis_client.xadd(
         STREAM_NAME,
         {
             "document_id": document_id,

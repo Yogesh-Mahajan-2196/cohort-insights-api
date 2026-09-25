@@ -1,48 +1,51 @@
 from contextlib import asynccontextmanager
-from db.indexes import create_indexes
-from core.config import settings
-from pymongo import AsyncMongoClient
+
 import redis.asyncio as redis
-from fastapi import FastAPI
+from pymongo import AsyncMongoClient
+
+from core.config import settings
+from db.indexes import create_indexes
 from workers.queue import create_consumer_group
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app):
 
-    # MongoDB Connection
-    mongo_client = AsyncMongoClient(settings.MONGO_URI)
-
-    # Redis Connection
-    redis_client = redis.from_url(
-        settings.REDIS_URL,
-        decode_responses = True
+    mongo_client = AsyncMongoClient(
+        settings.MONGO_URI
     )
 
-    # Strpre connections inside FastAPI
-    app.state.mongo_client = mongo_client
-    app.state.db = mongo_client[settings.MONGO_DATABASE]
-    app.state.redis = redis_client
+    db = mongo_client[
+        settings.MONGO_DATABASE
+    ]
 
-    # Test Mongo Connection
-    await mongo_client.admin.command("ping")
+    redis_client = redis.from_url(
+        settings.REDIS_URL,
+        decode_responses=True,
+    )
 
-    # Test Redis Connection
-    await redis_client.ping()
+    try:
 
-    # Create MongoDB indexes
-    await create_indexes(app.state.db)
+        await db.command("ping")
+        await redis_client.ping()
 
-    await create_consumer_group(redis_client)
+        await create_indexes(db)
 
-    print("Mongo connected")
-    print("Redis connected")
-    print("MongoDB indexes created")
-    print("Redis consumer group ready")
-    
-    yield
+        await create_consumer_group(
+            redis_client
+        )
 
-    await redis_client.aclose()
-    await mongo_client.close()
+        app.state.mongo_client = mongo_client
+        app.state.db = db
+        app.state.redis = redis_client
 
-    print("Connection closed")
+        print("MongoDB connected")
+        print("Redis connected")
+
+        yield
+
+    finally:
+
+        await redis_client.aclose()
+
+        mongo_client.close()
