@@ -1,18 +1,18 @@
 import asyncio
 import random
 
-from bson import ObjectId
-from pymongo import AsyncMongoClient
 import redis.asyncio as redis
 
+from bson import ObjectId
+from pymongo import AsyncMongoClient
+
 from core.config import settings
+from services.cache import set_cached_result
+from services.limits import release_job
 from workers.queue import (
     STREAM_NAME,
     GROUP_NAME,
 )
-
-
-CONSUMER_NAME = "worker-1"
 
 
 async def process_stage(
@@ -20,17 +20,11 @@ async def process_stage(
     document_id: str,
     version: int,
 ):
-    """
-    Stage 1:
-    processing
-    """
-
     object_id = ObjectId(document_id)
 
-    # -----------------------------------------
-    # Mark processing
-    # -----------------------------------------
-
+    # ---------------------------------------------------------
+    # Atomically claim the current queued version.
+    # ---------------------------------------------------------
     result = await db.documents.update_one(
         {
             "_id": object_id,
@@ -41,193 +35,232 @@ async def process_stage(
             "$set": {
                 "status": "processing",
                 "processing.status": "processing",
+                "processing.content_version": version,
             }
         },
     )
 
     if result.modified_count == 0:
-        return False
+        print(
+            f"[{document_id}] "
+            f"Version {version} is stale or already processed."
+        )
 
-    # -----------------------------------------
-    # Simulate processing
-    # -----------------------------------------
+        return "stale"
 
-    delay = random.uniform(10, 20)
+    document = await db.documents.find_one(
+        {
+            "_id": object_id,
+            "content_version": version,
+        }
+    )
+
+    if not document:
+        return "stale"
 
     print(
         f"[{document_id}] "
-        f"Stage 1 started. "
-        f"Sleeping {delay:.2f}s"
+        f"Stage 1 started for version {version}"
     )
 
-    await asyncio.sleep(delay)
+    sleep_time = random.uniform(10, 20)
 
-    # -----------------------------------------
-    # Random failure ~10%
-    # -----------------------------------------
+    await asyncio.sleep(sleep_time)
 
+    # ---------------------------------------------------------
+    # Simulated 10% failure
+    # ---------------------------------------------------------
     if random.random() < 0.10:
 
-        await db.documents.update_one(
+        result = await db.documents.update_one(
             {
                 "_id": object_id,
                 "content_version": version,
+                "processing.content_version": version,
+                "processing.status": "processing",
             },
             {
                 "$set": {
                     "status": "failed",
                     "failed_stage": "processing",
                     "processing.status": "failed",
+                    "processing.content_version": version,
                 }
             },
         )
 
-        print(
-            f"[{document_id}] "
-            f"Stage 1 FAILED"
-        )
+        if result.modified_count:
+            print(
+                f"[{document_id}] "
+                f"Stage 1 failed for version {version}"
+            )
 
-        return False
+            return "failed"
 
-    # -----------------------------------------
+        return "stale"
+
+    # ---------------------------------------------------------
     # Generate mock summary
-    # -----------------------------------------
-
-    document = await db.documents.find_one(
-        {
-            "_id": object_id,
-            "content_version": version,
-        }
-    )
-
-    if not document:
-        return False
-
-    content = document["content"]
-
+    # ---------------------------------------------------------
     summary = (
-        f"Mock summary for document: "
-        f"{content[:100]}"
+        "Mock summary for document: "
+        f"{document['content'][:200]}"
     )
 
-    # -----------------------------------------
-    # Save Stage 1 result
-    # -----------------------------------------
-
+    # ---------------------------------------------------------
+    # Save only if version is still current
+    # ---------------------------------------------------------
     result = await db.documents.update_one(
         {
             "_id": object_id,
             "content_version": version,
-            "status": "processing",
+            "processing.content_version": version,
+            "processing.status": "processing",
         },
         {
             "$set": {
                 "processing.status": "completed",
                 "processing.summary": summary,
                 "processing.content_version": version,
+
                 "status": "enriching",
+
+                "updated_at": __import__(
+                    "datetime"
+                ).datetime.now(
+                    __import__(
+                        "datetime"
+                    ).timezone.utc
+                ),
             }
         },
     )
 
     if result.modified_count == 0:
-        return False
+        print(
+            f"[{document_id}] "
+            f"Stage 1 result ignored. "
+            f"Version {version} is stale."
+        )
+
+        return "stale"
 
     print(
         f"[{document_id}] "
-        f"Stage 1 completed"
+        f"Stage 1 completed for version {version}"
     )
 
-    return True
+    return "success"
 
 
 async def enrich_stage(
     db,
+    redis_client,
     document_id: str,
     version: int,
 ):
-    """
-    Stage 2:
-    enriching
-    """
-
     object_id = ObjectId(document_id)
 
+    # ---------------------------------------------------------
+    # Read only the current version
+    # ---------------------------------------------------------
     document = await db.documents.find_one(
         {
             "_id": object_id,
             "content_version": version,
-            "processing.content_version": version,
             "processing.status": "completed",
+            "processing.content_version": version,
         }
     )
 
     if not document:
         print(
             f"[{document_id}] "
-            f"Stage 2 skipped - version changed"
+            f"Stage 2 skipped. "
+            f"Version {version} is stale."
         )
-        return False
 
-    # -----------------------------------------
-    # Simulate enriching
-    # -----------------------------------------
-
-    delay = random.uniform(5, 15)
+        return "stale"
 
     print(
         f"[{document_id}] "
-        f"Stage 2 started. "
-        f"Sleeping {delay:.2f}s"
+        f"Stage 2 started for version {version}"
     )
 
-    await asyncio.sleep(delay)
+    sleep_time = random.uniform(5, 15)
 
-    # -----------------------------------------
-    # Random failure ~10%
-    # -----------------------------------------
+    await asyncio.sleep(sleep_time)
 
+    # ---------------------------------------------------------
+    # Simulated 10% failure
+    # ---------------------------------------------------------
     if random.random() < 0.10:
 
-        await db.documents.update_one(
+        result = await db.documents.update_one(
             {
                 "_id": object_id,
                 "content_version": version,
+                "processing.status": "completed",
+                "processing.content_version": version,
             },
             {
                 "$set": {
                     "status": "failed",
                     "failed_stage": "enriching",
                     "enriching.status": "failed",
+                    "enriching.content_version": version,
                 }
             },
         )
 
-        print(
-            f"[{document_id}] "
-            f"Stage 2 FAILED"
-        )
+        if result.modified_count:
+            print(
+                f"[{document_id}] "
+                f"Stage 2 failed for version {version}"
+            )
 
-        return False
+            return "failed"
 
-    # -----------------------------------------
-    # Generate mock tags
-    # -----------------------------------------
+        return "stale"
 
-    tags = [
+    # ---------------------------------------------------------
+    # Generate mock tags based on stage-1 summary/content
+    # ---------------------------------------------------------
+    text = (
+        document["processing"]["summary"]
+        + " "
+        + document["content"]
+    ).lower()
+
+    possible_tags = [
         "python",
         "fastapi",
         "backend",
+        "redis",
+        "mongodb",
+        "api",
     ]
 
-    # -----------------------------------------
-    # Save Stage 2 result
-    # -----------------------------------------
+    tags = [
+        tag
+        for tag in possible_tags
+        if tag in text
+    ]
 
+    if not tags:
+        tags = [
+            "backend",
+            "api",
+        ]
+
+    # ---------------------------------------------------------
+    # Atomically complete stage 2
+    # ---------------------------------------------------------
     result = await db.documents.update_one(
         {
             "_id": object_id,
             "content_version": version,
+            "processing.status": "completed",
             "processing.content_version": version,
         },
         {
@@ -235,70 +268,157 @@ async def enrich_stage(
                 "enriching.status": "completed",
                 "enriching.tags": tags,
                 "enriching.content_version": version,
+
                 "status": "completed",
                 "failed_stage": None,
+
+                "updated_at": __import__(
+                    "datetime"
+                ).datetime.now(
+                    __import__(
+                        "datetime"
+                    ).timezone.utc
+                ),
             }
         },
     )
 
     if result.modified_count == 0:
-        return False
+        print(
+            f"[{document_id}] "
+            f"Stage 2 result ignored. "
+            f"Version {version} is stale."
+        )
+
+        return "stale"
+
+    # ---------------------------------------------------------
+    # ONLY cache after successful Stage 2
+    # ---------------------------------------------------------
+    await set_cached_result(
+        redis_client,
+        document["content_hash"],
+        {
+            "summary": document["processing"]["summary"],
+            "tags": tags,
+        },
+    )
 
     print(
         f"[{document_id}] "
-        f"Stage 2 completed"
+        f"Stage 2 completed for version {version}"
     )
 
-    return True
+    return "success"
 
 
 async def process_document(
     db,
+    redis_client,
     document_id: str,
     version: int,
 ):
-    """
-    Execute both stages.
-    """
-
-    success = await process_stage(
+    result = await process_stage(
         db,
         document_id,
         version,
     )
 
-    if not success:
+    # ---------------------------------------------------------
+    # Stale job:
+    # NEVER release active slot.
+    #
+    # The newer version owns that slot.
+    # ---------------------------------------------------------
+    if result == "stale":
         return
 
-    await enrich_stage(
+    # ---------------------------------------------------------
+    # Stage 1 failed.
+    # Current version owns slot and is now terminal.
+    # ---------------------------------------------------------
+    if result == "failed":
+
+        document = await db.documents.find_one(
+            {
+                "_id": ObjectId(document_id),
+                "content_version": version,
+                "status": "failed",
+            }
+        )
+
+        if document:
+            await release_job(
+                redis_client,
+                document["user_id"],
+            )
+
+        return
+
+    # ---------------------------------------------------------
+    # Stage 2
+    # ---------------------------------------------------------
+    result = await enrich_stage(
         db,
+        redis_client,
         document_id,
         version,
     )
+
+    if result == "stale":
+        return
+
+    # ---------------------------------------------------------
+    # Release only if THIS version reached terminal state.
+    # ---------------------------------------------------------
+    document = await db.documents.find_one(
+        {
+            "_id": ObjectId(document_id),
+            "content_version": version,
+            "status": {
+                "$in": [
+                    "completed",
+                    "failed",
+                ]
+            },
+        }
+    )
+
+    if document:
+        await release_job(
+            redis_client,
+            document["user_id"],
+        )
 
 
 async def worker():
-
     mongo_client = AsyncMongoClient(
         settings.MONGO_URI
-    )
-
-    redis_client = redis.from_url(
-        settings.REDIS_URL,
-        decode_responses=True,
     )
 
     db = mongo_client[
         settings.MONGO_DATABASE
     ]
 
-    print("Worker started")
+    redis_client = redis.from_url(
+        settings.REDIS_URL,
+        decode_responses=True,
+        socket_timeout=None,
+    )
+
+    consumer_name = (
+        f"worker-{random.randint(1000, 9999)}"
+    )
+
+    print(
+        f"Worker started: {consumer_name}"
+    )
 
     while True:
 
         messages = await redis_client.xreadgroup(
             groupname=GROUP_NAME,
-            consumername=CONSUMER_NAME,
+            consumername=consumer_name,
             streams={
                 STREAM_NAME: ">"
             },
@@ -309,28 +429,31 @@ async def worker():
         if not messages:
             continue
 
-        for stream_name, entries in messages:
+        for stream_name, stream_messages in messages:
 
-            for message_id, data in entries:
+            for message_id, data in stream_messages:
 
-                document_id = data["document_id"]
+                document_id = data[
+                    "document_id"
+                ]
+
                 version = int(
                     data["content_version"]
                 )
 
                 print(
-                    f"Received job "
-                    f"{message_id} "
-                    f"for document "
-                    f"{document_id}"
+                    f"Received job {message_id} "
+                    f"for document {document_id} "
+                    f"version {version}"
                 )
 
                 try:
 
                     await process_document(
-                        db=db,
-                        document_id=document_id,
-                        version=version,
+                        db,
+                        redis_client,
+                        document_id,
+                        version,
                     )
 
                     await redis_client.xack(
@@ -342,13 +465,10 @@ async def worker():
                 except Exception as exc:
 
                     print(
-                        f"Worker error: {exc}"
+                        f"Worker error for "
+                        f"{document_id}: {exc}"
                     )
 
 
-async def main():
-    await worker()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(worker())
