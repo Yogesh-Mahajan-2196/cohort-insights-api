@@ -1,5 +1,4 @@
 STREAM_NAME = "document_processing"
-
 GROUP_NAME = "document_workers"
 
 
@@ -12,7 +11,6 @@ async def create_consumer_group(redis):
             mkstream=True,
         )
     except Exception as exc:
-        # BUSYGROUP means the group already exists.
         if "BUSYGROUP" not in str(exc):
             raise
 

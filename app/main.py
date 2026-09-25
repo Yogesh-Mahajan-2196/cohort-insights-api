@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
 from core.config import settings
 from db.db_connect import lifespan
 from api.routes.documents import document_router
+from db.mongodb import get_database
+from db.redis import get_redis
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -14,31 +16,37 @@ app.include_router(document_router)
 
 
 @app.get("/health")
-async def health(request:Request):
+async def health(
+    db=Depends(get_database),
+    redis=Depends(get_redis),
+):
     mongo_status = "ok"
     redis_status = "ok"
 
     try:
-        await request.app.state.db.command("ping")
+        await db.command("ping")
     except Exception:
         mongo_status = "error"
 
     try:
-        await request.app.state.redis.ping()
+        await redis.ping()
     except Exception:
         redis_status = "error"
 
-    is_healthy = (
+    healthy = (
         mongo_status == "ok"
-        and
-        redis_status == "ok"
+        and redis_status == "ok"
     )
 
     return JSONResponse(
-        status_code=200 if is_healthy else 503,
-        content= {
-            "status": "ok" if is_healthy else "degraded",
+        status_code=200 if healthy else 503,
+        content={
+            "status": (
+                "ok"
+                if healthy
+                else "degraded"
+            ),
             "mongodb": mongo_status,
-            "redis": redis_status
-        }
+            "redis": redis_status,
+        },
     )
