@@ -2,16 +2,23 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timezone
-import sys
-
+import time
 import redis.asyncio as redis
 from bson import ObjectId
 from pymongo import AsyncMongoClient
 
 from core.config import settings
 from services.cache import set_cached_result
-from services.limits import release_job
-from workers.queue import GROUP_NAME, STREAM_NAME
+from services.limits import (
+    release_job,
+    update_job_info,
+    delete_job_info,
+)
+from workers.queue import (
+    GROUP_NAME,
+    STREAM_NAME,
+    create_consumer_group,
+)
 from workers.text_extractor import extract_tags
 
 logging.basicConfig(
@@ -28,8 +35,7 @@ STAGE_2_MAX_RETRIES = 2
 STAGE_2_BASE_BACKOFF = 1
 
 # Redis message is considered abandoned after 60 seconds.
-REDIS_MESSAGE_MIN_IDLE_MS = 60_000
-
+REDIS_MESSAGE_MIN_IDLE_MS = 180_000
 
 # =========================================================
 # HELPERS
@@ -137,6 +143,7 @@ async def mark_enriching_failed(
 
 async def process_stage(
     db,
+    redis_client,
     document_id: str,
     version: int,
 ):
@@ -154,9 +161,9 @@ async def process_stage(
         document_id
     )
 
-    # -----------------------------------------------------
-    # Atomically claim this exact version.
-    # -----------------------------------------------------
+    # =====================================================
+    # 1. Atomically claim this exact version
+    # =====================================================
 
     result = await db.documents.update_one(
         {
@@ -176,6 +183,10 @@ async def process_stage(
         },
     )
 
+    # -----------------------------------------------------
+    # Another worker already claimed this version
+    # -----------------------------------------------------
+
     if result.modified_count != 1:
 
         logger.info(
@@ -187,9 +198,9 @@ async def process_stage(
 
         return "stale"
 
-    # -----------------------------------------------------
-    # Read the exact version.
-    # -----------------------------------------------------
+    # =====================================================
+    # 2. Read the document
+    # =====================================================
 
     document = await db.documents.find_one(
         {
@@ -203,6 +214,10 @@ async def process_stage(
         }
     )
 
+    # -----------------------------------------------------
+    # Document disappeared or became stale
+    # -----------------------------------------------------
+
     if not document:
 
         logger.info(
@@ -214,25 +229,54 @@ async def process_stage(
 
         return "stale"
 
+    # =====================================================
+    # 3. Update Redis job status
+    #
+    # IMPORTANT:
+    # document is available now.
+    # =====================================================
+
+    await update_job_info(
+        redis_client=redis_client,
+
+        user_id=document["user_id"],
+
+        client_doc_ref=document.get(
+            "client_doc_ref"
+        ),
+
+        document_id=document_id,
+
+        version=version,
+
+        status="processing",
+    )
+
     logger.info(
         "[%s] Stage 1 started. Version %s",
         document_id,
         version,
     )
 
-    # -----------------------------------------------------
-    # Simulate processing.
-    # -----------------------------------------------------
+    # =====================================================
+    # 4. Simulate Stage 1 processing
+    # =====================================================
 
     await asyncio.sleep(
         random.uniform(10, 20)
     )
 
-    # -----------------------------------------------------
-    # Simulated failure.
-    # -----------------------------------------------------
+    # =====================================================
+    # 5. Simulated failure
+    # =====================================================
 
-    if random.random() < 0.10:
+    # TEMPORARILY DISABLED WHILE TESTING.
+    #
+    # Once everything works, you can change this back to:
+    #
+    # if random.random() < 0.10:
+
+    if False:
 
         failed = await mark_processing_failed(
             db=db,
@@ -252,9 +296,9 @@ async def process_stage(
 
         return "stale"
 
-    # -----------------------------------------------------
-    # Generate summary.
-    # -----------------------------------------------------
+    # =====================================================
+    # 6. Generate summary
+    # =====================================================
 
     summary = (
         f"Processed document "
@@ -263,10 +307,12 @@ async def process_stage(
         f"{document['content'][:200]}"
     )
 
-    # -----------------------------------------------------
-    # Complete Stage 1 only if this version is still
+    # =====================================================
+    # 7. Complete Stage 1
+    #
+    # Only update if this exact version is still
     # processing.
-    # -----------------------------------------------------
+    # =====================================================
 
     result = await db.documents.update_one(
         {
@@ -281,7 +327,9 @@ async def process_stage(
         {
             "$set": {
                 "processing.status": "completed",
+
                 "processing.summary": summary,
+
                 "processing.content_version": version,
 
                 "status": "enriching",
@@ -290,6 +338,10 @@ async def process_stage(
             }
         },
     )
+
+    # -----------------------------------------------------
+    # Version became stale while Stage 1 was running
+    # -----------------------------------------------------
 
     if result.modified_count != 1:
 
@@ -301,6 +353,28 @@ async def process_stage(
         )
 
         return "stale"
+
+    # =====================================================
+    # 8. Update Redis status
+    #
+    # processing -> enriching
+    # =====================================================
+
+    await update_job_info(
+        redis_client=redis_client,
+
+        user_id=document["user_id"],
+
+        client_doc_ref=document.get(
+            "client_doc_ref"
+        ),
+
+        document_id=document_id,
+
+        version=version,
+
+        status="enriching",
+    )
 
     logger.info(
         "[%s] Stage 1 completed. Version %s",
@@ -516,6 +590,7 @@ async def release_terminal_job(
             "user_id": 1,
             "content_version": 1,
             "status": 1,
+            "client_doc_ref": 1,
         },
     )
 
@@ -535,6 +610,17 @@ async def release_terminal_job(
         document["user_id"],
         document_id,
         version,
+    )
+
+    await update_job_info(
+        redis_client=redis_client,
+        user_id=document["user_id"],
+        client_doc_ref=document.get(
+            "client_doc_ref"
+        ),
+        document_id=document_id,
+        version=version,
+        status=document["status"],
     )
 
     logger.info(
@@ -573,6 +659,7 @@ async def process_document(
 
     stage1_result = await process_stage(
         db=db,
+        redis_client=redis_client,
         document_id=document_id,
         version=version,
     )
@@ -869,6 +956,17 @@ async def worker():
         socket_timeout=None,
     )
 
+    await redis_client.ping()
+
+    print(
+        f"[REDIS] Worker connected to Redis: "
+        f"{settings.REDIS_URL}"
+    )
+
+    await create_consumer_group(
+        redis_client
+    )
+
     consumer_name = (
         f"worker-{random.randint(1000, 999999)}"
     )
@@ -879,8 +977,15 @@ async def worker():
     )
 
     try:
-
+        last_heartbeat = time.monotonic()
         while True:
+
+            if time.monotonic() - last_heartbeat >= 10:
+                logger.info(
+                    "Worker alive: %s | waiting for jobs",
+                    consumer_name,
+                )
+                last_heartbeat = time.monotonic()
 
             # =================================================
             # 1. Recover abandoned messages

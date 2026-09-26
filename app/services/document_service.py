@@ -11,9 +11,12 @@ from services.cache import (
     set_cached_result,
 )
 from services.limits import (
+    MAX_ACTIVE_JOBS,
     reserve_job,
     release_job,
     update_active_job_version,
+    set_job_info,
+    delete_job_info,
 )
 from workers.queue import enqueue_document
 
@@ -425,10 +428,19 @@ async def create_document(
         raise HTTPException(
             status_code=429,
             detail=(
-                "Maximum 3 active documents "
+                f"Maximum {MAX_ACTIVE_JOBS} active "
                 "allowed per user"
             ),
         )
+
+    await set_job_info(
+        redis_client=redis_client,
+        user_id=user_id,
+        client_doc_ref=client_doc_ref,
+        document_id=document_id,
+        version=version,
+        status="queued",
+    )
 
     try:
         # -----------------------------------------------------
@@ -595,7 +607,7 @@ async def update_document(
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    "Maximum 3 active documents "
+                    f"Maximum {MAX_ACTIVE_JOBS} active "
                     "allowed per user"
                 ),
             )
@@ -663,6 +675,15 @@ async def update_document(
                 document_id=document_id,
                 version=new_version,
             )
+
+        await set_job_info(
+            redis_client=redis_client,
+            user_id=user_id,
+            client_doc_ref=current.get("client_doc_ref"),
+            document_id=document_id,
+            version=new_version,
+            status="queued",
+        )
 
         # =====================================================
         # 7. Enqueue new version

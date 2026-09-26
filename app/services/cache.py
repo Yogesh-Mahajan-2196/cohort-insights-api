@@ -31,7 +31,7 @@ async def get_cached_result(
         cached = await redis_client.get(key)
 
         if not cached:
-            return None
+            return None 
 
         return json.loads(cached)
 
