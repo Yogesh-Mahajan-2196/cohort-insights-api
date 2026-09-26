@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentCreate(BaseModel):
@@ -13,6 +13,7 @@ class DocumentCreate(BaseModel):
 
 
 class DocumentUpdate(BaseModel):
+    user_id: str = Field(min_length=1, max_length=100)
     content: str = Field(min_length=1)
 
 
@@ -27,9 +28,9 @@ class DocumentResponse(BaseModel):
     document_id: str
     user_id: str
     title: str
+    client_doc_ref: str | None = None
 
     status: str
-
     content_version: int
     content_hash: str
 
@@ -38,7 +39,5 @@ class DocumentResponse(BaseModel):
 
     summary: str | None = None
     tags: list[str] = Field(default_factory=list)
-
     failed_stage: str | None = None
-
     is_stale: bool

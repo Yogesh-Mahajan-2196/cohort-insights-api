@@ -12,7 +12,6 @@ from services.cache import set_cached_result
 from services.limits import (
     release_job,
     update_job_info,
-    delete_job_info,
 )
 from workers.queue import (
     GROUP_NAME,
@@ -300,9 +299,10 @@ async def process_stage(
     # 6. Generate summary
     # =====================================================
 
+    # Summary is content-derived, not title-derived, so the
+    # content-hash cache remains valid when another request uses
+    # the same content with a different title.
     summary = (
-        f"Processed document "
-        f"'{document['title']}'. "
         f"Content summary: "
         f"{document['content'][:200]}"
     )
@@ -436,6 +436,15 @@ async def enrich_stage(
 
         return "stale"
 
+    await update_job_info(
+        redis_client=redis_client,
+        user_id=document["user_id"],
+        client_doc_ref=document.get("client_doc_ref"),
+        document_id=document_id,
+        version=version,
+        status="enriching",
+    )
+
     logger.info(
         "[%s] Stage 2 attempt started. Version %s",
         document_id,
@@ -468,10 +477,16 @@ async def enrich_stage(
     # Generate tags.
     # -----------------------------------------------------
 
-    summary = document[
-        "processing"
-    ]["summary"]
+    summary = (document.get("processing") or {}).get("summary")
 
+    if not isinstance(summary, str):
+        logger.error(
+            "[%s] Stage 2 cannot run because Stage 1 summary is missing. "
+            "Version %s",
+            document_id,
+            version,
+        )
+        return "stale"
 
     tags = extract_tags(
         content=document["content"],

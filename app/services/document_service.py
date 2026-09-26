@@ -6,32 +6,23 @@ from fastapi import HTTPException
 from pymongo.errors import DuplicateKeyError
 
 from models.documents import build_document
-from services.cache import (
-    get_cached_result,
-    set_cached_result,
-)
+from services.cache import get_cached_result, set_cached_result
 from services.limits import (
     MAX_ACTIVE_JOBS,
     reserve_job,
     release_job,
-    update_active_job_version,
     set_job_info,
+    update_active_job_version,
     delete_job_info,
 )
 from workers.queue import enqueue_document
 
 
-ACTIVE_STATUSES = {
-    "queued",
-    "processing",
-    "enriching",
-}
+ACTIVE_STATUSES = {"queued", "processing", "enriching"}
 
 
 def calculate_content_hash(content: str) -> str:
-    return hashlib.sha256(
-        content.encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def utc_now():
@@ -40,7 +31,6 @@ def utc_now():
 
 def build_document_response(document: dict) -> dict:
     current_version = document["content_version"]
-
     processing = document.get("processing") or {}
     enriching = document.get("enriching") or {}
 
@@ -51,7 +41,6 @@ def build_document_response(document: dict) -> dict:
         processing.get("status") == "completed"
         and processing_version == current_version
     )
-
     enriching_current = (
         enriching.get("status") == "completed"
         and enriching_version == current_version
@@ -67,47 +56,39 @@ def build_document_response(document: dict) -> dict:
         "document_id": str(document["_id"]),
         "user_id": document["user_id"],
         "title": document["title"],
-
+        "client_doc_ref": document.get("client_doc_ref"),
         "status": document["status"],
-
         "content_version": current_version,
         "content_hash": document["content_hash"],
-
         "processing": {
-            "status": processing.get(
-                "status",
-                "queued",
-            ),
+            "status": processing.get("status", "queued"),
             "content_version": processing_version,
         },
-
         "enriching": {
-            "status": enriching.get(
-                "status",
-                "queued",
-            ),
+            "status": enriching.get("status", "queued"),
             "content_version": enriching_version,
         },
-
-        # Never expose an old result for a newer content version.
         "summary": (
             processing.get("summary")
             if processing_current
             else None
         ),
-
         "tags": (
             enriching.get("tags", [])
             if enriching_current
             else []
         ),
-
-        "failed_stage": document.get(
-            "failed_stage"
-        ),
-
+        "failed_stage": document.get("failed_stage"),
         "is_stale": not result_current,
     }
+
+
+def _is_valid_cached_result(result: dict | None) -> bool:
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("summary"), str)
+        and isinstance(result.get("tags", []), list)
+    )
 
 
 def build_cached_document(
@@ -118,13 +99,6 @@ def build_cached_document(
     cached_result: dict,
     client_doc_ref: str | None = None,
 ) -> dict:
-    """
-    Build a new completed document from an already-computed result.
-
-    This does not consume an active processing slot because the
-    document does not need background processing.
-    """
-
     document = build_document(
         user_id=user_id,
         title=title,
@@ -134,13 +108,13 @@ def build_cached_document(
     )
 
     document["status"] = "completed"
+    document["failed_stage"] = None
 
     document["processing"] = {
         "status": "completed",
         "summary": cached_result["summary"],
         "content_version": 1,
     }
-
     document["enriching"] = {
         "status": "completed",
         "tags": cached_result.get("tags", []),
@@ -159,13 +133,6 @@ async def _insert_cached_document(
     cached_result: dict,
     client_doc_ref: str | None = None,
 ):
-    """
-    Insert a completed document generated from cache.
-
-    DuplicateKeyError is intentionally allowed to propagate so the
-    caller can handle client_doc_ref races.
-    """
-
     document = build_cached_document(
         user_id=user_id,
         title=title,
@@ -176,26 +143,11 @@ async def _insert_cached_document(
     )
 
     await db.documents.insert_one(document)
-
     return document
 
 
-async def _get_mongo_cached_result(
-    db,
-    content_hash: str,
-):
-    """
-    Find a genuinely completed/current result for this content hash.
-
-    A document is usable as a cache only when:
-      - the document is completed
-      - processing is completed
-      - enriching is completed
-      - processing version == document version
-      - enriching version == document version
-    """
-
-    cached_document = await db.documents.find_one(
+async def _get_mongo_cached_result(db, content_hash: str):
+    document = await db.documents.find_one(
         {
             "content_hash": content_hash,
             "status": "completed",
@@ -204,63 +156,43 @@ async def _get_mongo_cached_result(
         }
     )
 
-    if not cached_document:
+    if not document:
         return None
 
-    current_version = cached_document.get(
-        "content_version"
-    )
+    current_version = document.get("content_version")
+    processing = document.get("processing") or {}
+    enriching = document.get("enriching") or {}
 
-    processing = cached_document.get(
-        "processing"
-    ) or {}
-
-    enriching = cached_document.get(
-        "enriching"
-    ) or {}
-
-    if (
-        processing.get("content_version")
-        != current_version
-    ):
+    if processing.get("content_version") != current_version:
         return None
 
-    if (
-        enriching.get("content_version")
-        != current_version
-    ):
+    if enriching.get("content_version") != current_version:
         return None
 
-    if "summary" not in processing:
+    summary = processing.get("summary")
+    tags = enriching.get("tags", [])
+
+    if not isinstance(summary, str) or not isinstance(tags, list):
         return None
 
     return {
-        "summary": processing["summary"],
-        "tags": enriching.get("tags", []),
+        "summary": summary,
+        "tags": tags,
     }
 
 
-async def _find_existing_by_client_ref(
-    db,
-    client_doc_ref: str,
-):
+async def _find_existing_by_client_ref(db, client_doc_ref: str):
     return await db.documents.find_one(
-        {
-            "client_doc_ref": client_doc_ref,
-        }
+        {"client_doc_ref": client_doc_ref}
     )
 
 
-async def _handle_duplicate_client_ref(
+async def _resolve_duplicate_client_ref(
     db,
     user_id: str,
     client_doc_ref: str,
     content_hash: str,
 ):
-    """
-    Resolve a client_doc_ref race after a DuplicateKeyError.
-    """
-
     existing = await _find_existing_by_client_ref(
         db,
         client_doc_ref,
@@ -272,18 +204,15 @@ async def _handle_duplicate_client_ref(
             detail="Duplicate document reference",
         )
 
-    # Do not reveal another user's document.
     if existing["user_id"] != user_id:
         raise HTTPException(
             status_code=404,
             detail="Document not found",
         )
 
-    # Same reference + same content = idempotent retry.
     if existing["content_hash"] == content_hash:
-        return existing
+        return existing, False
 
-    # Same reference + different content = conflict.
     raise HTTPException(
         status_code=409,
         detail=(
@@ -303,15 +232,13 @@ async def create_document(
 ):
     content_hash = calculate_content_hash(content)
 
-    # =========================================================
-    # 1. client_doc_ref idempotency check
-    # =========================================================
-
+    # ---------------------------------------------------------
+    # 1. Idempotency by client_doc_ref.
+    # ---------------------------------------------------------
     if client_doc_ref:
-        existing = await db.documents.find_one(
-            {
-                "client_doc_ref": client_doc_ref,
-            }
+        existing = await _find_existing_by_client_ref(
+            db,
+            client_doc_ref,
         )
 
         if existing:
@@ -322,7 +249,7 @@ async def create_document(
                 )
 
             if existing["content_hash"] == content_hash:
-                return existing
+                return existing, False
 
             raise HTTPException(
                 status_code=409,
@@ -332,18 +259,18 @@ async def create_document(
                 ),
             )
 
-    # =========================================================
-    # 2. Redis result cache
-    # =========================================================
-
+    # ---------------------------------------------------------
+    # 2. Redis completed-result cache.
+    # Cache hits do not create a background job.
+    # ---------------------------------------------------------
     cached_result = await get_cached_result(
         redis_client,
         content_hash,
     )
 
-    if cached_result:
+    if _is_valid_cached_result(cached_result):
         try:
-            return await _insert_cached_document(
+            document = await _insert_cached_document(
                 db=db,
                 user_id=user_id,
                 title=title,
@@ -353,27 +280,39 @@ async def create_document(
                 client_doc_ref=client_doc_ref,
             )
 
+            await set_job_info(
+                redis_client=redis_client,
+                user_id=user_id,
+                client_doc_ref=client_doc_ref,
+                document_id=str(document["_id"]),
+                version=1,
+                status="completed",
+            )
+
+            return document, True
+
         except DuplicateKeyError:
             if client_doc_ref:
-                return await _handle_duplicate_client_ref(
-                    db=db,
-                    user_id=user_id,
-                    client_doc_ref=client_doc_ref,
-                    content_hash=content_hash,
+                return await _resolve_duplicate_client_ref(
+                    db,
+                    user_id,
+                    client_doc_ref,
+                    content_hash,
                 )
+            raise HTTPException(
+                status_code=409,
+                detail="Duplicate document",
+            )
 
-            raise
-
-    # =========================================================
-    # 3. Mongo completed-result cache
-    # =========================================================
-
+    # ---------------------------------------------------------
+    # 3. Mongo completed-result cache.
+    # ---------------------------------------------------------
     cached_result = await _get_mongo_cached_result(
         db,
         content_hash,
     )
 
-    if cached_result:
+    if _is_valid_cached_result(cached_result):
         await set_cached_result(
             redis_client,
             content_hash,
@@ -381,7 +320,7 @@ async def create_document(
         )
 
         try:
-            return await _insert_cached_document(
+            document = await _insert_cached_document(
                 db=db,
                 user_id=user_id,
                 title=title,
@@ -391,21 +330,33 @@ async def create_document(
                 client_doc_ref=client_doc_ref,
             )
 
+            await set_job_info(
+                redis_client=redis_client,
+                user_id=user_id,
+                client_doc_ref=client_doc_ref,
+                document_id=str(document["_id"]),
+                version=1,
+                status="completed",
+            )
+
+            return document, True
+
         except DuplicateKeyError:
             if client_doc_ref:
-                return await _handle_duplicate_client_ref(
-                    db=db,
-                    user_id=user_id,
-                    client_doc_ref=client_doc_ref,
-                    content_hash=content_hash,
+                return await _resolve_duplicate_client_ref(
+                    db,
+                    user_id,
+                    client_doc_ref,
+                    content_hash,
                 )
+            raise HTTPException(
+                status_code=409,
+                detail="Duplicate document",
+            )
 
-            raise
-
-    # =========================================================
-    # 4. Create document and reserve active slot
-    # =========================================================
-
+    # ---------------------------------------------------------
+    # 4. New background job.
+    # ---------------------------------------------------------
     document = build_document(
         user_id=user_id,
         title=title,
@@ -417,43 +368,39 @@ async def create_document(
     document_id = str(document["_id"])
     version = document["content_version"]
 
-    reserved = await reserve_job(
+    reservation = await reserve_job(
         redis_client=redis_client,
         user_id=user_id,
         document_id=document_id,
         version=version,
     )
 
-    if not reserved:
+    if reservation == 0:
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Maximum {MAX_ACTIVE_JOBS} active "
-                "allowed per user"
+                "job(s) allowed per user"
             ),
         )
 
-    await set_job_info(
-        redis_client=redis_client,
-        user_id=user_id,
-        client_doc_ref=client_doc_ref,
-        document_id=document_id,
-        version=version,
-        status="queued",
-    )
-
-    try:
-        # -----------------------------------------------------
-        # Insert document
-        # -----------------------------------------------------
-
-        await db.documents.insert_one(
-            document
+    if reservation == 3:
+        raise HTTPException(
+            status_code=409,
+            detail="A newer version of this document is already active",
         )
 
-        # -----------------------------------------------------
-        # Enqueue job
-        # -----------------------------------------------------
+    try:
+        await set_job_info(
+            redis_client=redis_client,
+            user_id=user_id,
+            client_doc_ref=client_doc_ref,
+            document_id=document_id,
+            version=version,
+            status="queued",
+        )
+
+        await db.documents.insert_one(document)
 
         try:
             await enqueue_document(
@@ -461,45 +408,46 @@ async def create_document(
                 document_id=document_id,
                 version=version,
             )
-
-        except Exception:
-            # There is no usable job anymore.
+        except Exception as exc:
             await db.documents.delete_one(
                 {
                     "_id": document["_id"],
                     "content_version": version,
                 }
             )
-
+            await delete_job_info(
+                redis_client=redis_client,
+                user_id=user_id,
+                client_doc_ref=client_doc_ref,
+                document_id=document_id,
+            )
             raise HTTPException(
                 status_code=503,
                 detail="Unable to enqueue document",
-            )
+            ) from exc
 
-        # Important:
-        # Do NOT release the slot here.
-        #
-        # The worker owns the active slot until the complete
-        # processing pipeline finishes.
-
-        return document
+        return document, True
 
     except DuplicateKeyError:
-        # Release the reservation because this request did not
-        # create a usable active job.
         await release_job(
             redis_client,
             user_id,
             document_id,
             version,
         )
+        await delete_job_info(
+            redis_client=redis_client,
+            user_id=user_id,
+            client_doc_ref=client_doc_ref,
+            document_id=document_id,
+        )
 
         if client_doc_ref:
-            return await _handle_duplicate_client_ref(
-                db=db,
-                user_id=user_id,
-                client_doc_ref=client_doc_ref,
-                content_hash=content_hash,
+            return await _resolve_duplicate_client_ref(
+                db,
+                user_id,
+                client_doc_ref,
+                content_hash,
             )
 
         raise HTTPException(
@@ -514,6 +462,12 @@ async def create_document(
             document_id,
             version,
         )
+        await delete_job_info(
+            redis_client=redis_client,
+            user_id=user_id,
+            client_doc_ref=client_doc_ref,
+            document_id=document_id,
+        )
         raise
 
     except Exception:
@@ -522,6 +476,12 @@ async def create_document(
             user_id,
             document_id,
             version,
+        )
+        await delete_job_info(
+            redis_client=redis_client,
+            user_id=user_id,
+            client_doc_ref=client_doc_ref,
+            document_id=document_id,
         )
         raise
 
@@ -533,19 +493,6 @@ async def update_document(
     user_id: str,
     content: str,
 ):
-    """
-    Update document content using optimistic concurrency.
-
-    Every content change creates a new content_version.
-
-    Old workers may still finish, but worker-side version checks
-    must prevent them from modifying the newer version.
-    """
-
-    # =========================================================
-    # 1. Validate ObjectId
-    # =========================================================
-
     if not ObjectId.is_valid(document_id):
         raise HTTPException(
             status_code=404,
@@ -553,10 +500,6 @@ async def update_document(
         )
 
     object_id = ObjectId(document_id)
-
-    # =========================================================
-    # 2. Load current document
-    # =========================================================
 
     current = await db.documents.find_one(
         {
@@ -571,10 +514,6 @@ async def update_document(
             detail="Document not found",
         )
 
-    # =========================================================
-    # 3. Same content = idempotent/no-op
-    # =========================================================
-
     new_hash = calculate_content_hash(content)
 
     if new_hash == current["content_hash"]:
@@ -582,43 +521,42 @@ async def update_document(
 
     old_version = current["content_version"]
     new_version = old_version + 1
-
     old_status = current.get("status")
+    was_active = old_status in ACTIVE_STATUSES
 
-    was_active = (
-        old_status in ACTIVE_STATUSES
-    )
-
-    # =========================================================
-    # 4. Reserve slot only when old document wasn't active
-    # =========================================================
-
+    # If the document is terminal, a new active slot is needed.
+    # Reservation result 1 means this request created the slot.
+    # Result 2 means the document already owns the slot.
     reserved_new_slot = False
 
     if not was_active:
-        reserved_new_slot = await reserve_job(
+        reservation = await reserve_job(
             redis_client=redis_client,
             user_id=user_id,
             document_id=document_id,
             version=new_version,
         )
 
-        if not reserved_new_slot:
+        if reservation == 0:
             raise HTTPException(
                 status_code=429,
                 detail=(
                     f"Maximum {MAX_ACTIVE_JOBS} active "
-                    "allowed per user"
+                    "job(s) allowed per user"
                 ),
             )
+
+        if reservation == 3:
+            raise HTTPException(
+                status_code=409,
+                detail="A newer version of this document is already active",
+            )
+
+        reserved_new_slot = reservation == 1
 
     update_succeeded = False
 
     try:
-        # =====================================================
-        # 5. Optimistic concurrency update
-        # =====================================================
-
         result = await db.documents.update_one(
             {
                 "_id": object_id,
@@ -630,25 +568,18 @@ async def update_document(
                     "content": content,
                     "content_hash": new_hash,
                     "content_version": new_version,
-
                     "status": "queued",
-
                     "failed_stage": None,
-
-                    # Invalidate old processing result immediately.
                     "processing": {
                         "status": "queued",
                         "summary": None,
                         "content_version": None,
                     },
-
-                    # Invalidate old enrichment result immediately.
                     "enriching": {
                         "status": "queued",
                         "tags": [],
                         "content_version": None,
                     },
-
                     "updated_at": utc_now(),
                 }
             },
@@ -657,23 +588,20 @@ async def update_document(
         if result.modified_count != 1:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Document was updated by another request"
-                ),
+                detail="Document was updated by another request",
             )
 
         update_succeeded = True
 
-        # =====================================================
-        # 6. If already active, move slot to new version
-        # =====================================================
-
+        # For an already-active document, move the slot only if it
+        # still belongs to old_version. Never downgrade a newer slot.
         if was_active:
             await update_active_job_version(
                 redis_client=redis_client,
                 user_id=user_id,
                 document_id=document_id,
-                version=new_version,
+                old_version=old_version,
+                new_version=new_version,
             )
 
         await set_job_info(
@@ -685,18 +613,15 @@ async def update_document(
             status="queued",
         )
 
-        # =====================================================
-        # 7. Enqueue new version
-        # =====================================================
-
         try:
             await enqueue_document(
                 redis_client=redis_client,
                 document_id=document_id,
                 version=new_version,
             )
-
-        except Exception:
+        except Exception as exc:
+            # The update exists but cannot be processed. Mark it terminal
+            # and release only this exact version.
             await db.documents.update_one(
                 {
                     "_id": object_id,
@@ -706,29 +631,49 @@ async def update_document(
                     "$set": {
                         "status": "failed",
                         "failed_stage": "processing",
+                        "processing.status": "failed",
+                        "processing.content_version": new_version,
                         "updated_at": utc_now(),
                     }
                 },
             )
 
             await release_job(
+                redis_client,
+                user_id,
+                document_id,
+                new_version,
+            )
+
+            await set_job_info(
                 redis_client=redis_client,
                 user_id=user_id,
+                client_doc_ref=current.get("client_doc_ref"),
                 document_id=document_id,
                 version=new_version,
+                status="failed",
             )
 
             raise HTTPException(
                 status_code=503,
                 detail="Unable to enqueue updated document",
-            )
-        
-        return await db.documents.find_one(
+            ) from exc
+
+        updated = await db.documents.find_one(
             {
                 "_id": object_id,
                 "user_id": user_id,
+                "content_version": new_version,
             }
         )
+
+        if not updated:
+            raise HTTPException(
+                status_code=500,
+                detail="Updated document could not be loaded",
+            )
+
+        return updated
 
     except HTTPException:
         raise
@@ -737,11 +682,8 @@ async def update_document(
         raise
 
     finally:
-        # If we reserved a brand-new slot and the update did not
-        # successfully become an active queued job, release it.
-        #
-        # If enqueue succeeded, the worker owns the lifecycle and
-        # will eventually release it.
+        # Release only if this request itself created the reservation
+        # and the Mongo update did not become a valid active job.
         if reserved_new_slot and not update_succeeded:
             await release_job(
                 redis_client,
